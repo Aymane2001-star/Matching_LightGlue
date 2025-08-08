@@ -446,9 +446,22 @@ class LightGlue(nn.Module):
         b, m, _ = kpts0.shape
         b, n, _ = kpts1.shape
         device = kpts0.device
-        if "view0" in data.keys() and "view1" in data.keys():
-            size0 = data["view0"].get("image_size")
-            size1 = data["view1"].get("image_size")
+        if "view0" in data and "view1" in data:
+            size0 = data["view0"].get("image_size", None)
+            size1 = data["view1"].get("image_size", None)
+        else:
+            size0 = data.get("image_size0", None)
+            size1 = data.get("image_size1", None)
+            if size0 is None and "image0" in data:
+                img0 = data["image0"]
+                if isinstance(img0, torch.Tensor) and img0.dim() == 4:
+                    _, _, h0, w0 = img0.shape
+                    size0 = torch.tensor([w0, h0], device=kpts0.device, dtype=kpts0.dtype)[None]
+            if size1 is None and "image1" in data:
+                img1 = data["image1"]
+                if isinstance(img1, torch.Tensor) and img1.dim() == 4:
+                    _, _, h1, w1 = img1.shape
+                    size1 = torch.tensor([w1, h1], device=kpts1.device, dtype=kpts1.dtype)[None]
         kpts0 = normalize_keypoints(kpts0, size0).clone()
         kpts1 = normalize_keypoints(kpts1, size1).clone()
 
@@ -483,11 +496,6 @@ class LightGlue(nn.Module):
         desc0 = self.input_proj(desc0)
         desc1 = self.input_proj(desc1)
 
-        if not self.training:                            #####################################################
-            with torch.no_grad():
-                norm0 = desc0.norm(dim=-1).mean().item()
-                norm1 = desc1.norm(dim=-1).mean().item()
-                print(f"[DEBUG] Descriptor norms - desc0: {norm0:.3f}, desc1: {norm1:.3f}")
 
 
         # cache positional embeddings

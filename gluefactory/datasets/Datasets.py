@@ -148,31 +148,38 @@ class FloorPlanDataset(Dataset):
                 print(f"Pas d'annotation trouvée pour la paire {idx}")
                 return torch.zeros((0, 2)), torch.zeros((0, 2))
 
-            # Points-clés pour la première image
-            kpts1 = []
-            kpts2 = []
+            # Points-clés indexés par label K1..K11 pour garantir l'alignement
+            kpts1 = torch.zeros((11, 2), dtype=torch.float32)
+            kpts2 = torch.zeros((11, 2), dtype=torch.float32)
+            valid1 = torch.zeros((11,), dtype=torch.bool)
+            valid2 = torch.zeros((11,), dtype=torch.bool)
 
             if 'annotations' in ann and len(ann['annotations']) > 0:
-                # Trier les points par leur label
                 results = ann['annotations'][0].get('result', [])
-                points = sorted(results,
-                              key=lambda x: int(x['value']['keypointlabels'][0][1:])
-                              if 'keypointlabels' in x['value'] else 0)
-
-                # Séparer les points entre les deux images
-                for point in points:
+                for point in results:
                     if 'value' not in point:
                         continue
+                    val = point['value']
+                    labels = val.get('keypointlabels', [])
+                    if not labels:
+                        continue
+                    label = labels[0]
+                    try:
+                        idx = int(''.join(filter(str.isdigit, label))) - 1
+                    except Exception:
+                        continue
+                    if not (0 <= idx < 11):
+                        continue
+                    x = val['x'] * point['original_width'] / 100
+                    y = val['y'] * point['original_height'] / 100
+                    if point.get('to_name') == 'img-1':
+                        kpts1[idx] = torch.tensor([x, y])
+                        valid1[idx] = True
+                    elif point.get('to_name') == 'img-2':
+                        kpts2[idx] = torch.tensor([x, y])
+                        valid2[idx] = True
 
-                    x = point['value']['x'] * point['original_width'] / 100
-                    y = point['value']['y'] * point['original_height'] / 100
-                   
-                    if point['to_name'] == 'img-1':
-                        kpts1.append([x, y])
-                    elif point['to_name'] == 'img-2':
-                        kpts2.append([x, y])
-
-            return torch.tensor(kpts1), torch.tensor(kpts2)
+            return kpts1, kpts2
 
         except Exception as e:
             print(f"Erreur lors de l'extraction des points-clés pour l'index {idx}: {e}")
@@ -229,9 +236,32 @@ class FloorPlanDataset(Dataset):
         img1 = torch.from_numpy(img1).unsqueeze(0)
         img2 = torch.from_numpy(img2).unsqueeze(0)
 
-        gt_assignment = torch.eye(11)
-        gt_matches0 = torch.arange(11, device=gt_assignment.device)
-        gt_matches1 = torch.arange(11, device=gt_assignment.device)
+        # Construire les GT en tenant compte du padding: -1 pour non-appairés
+        valid_mask0 = (kpts1[:, 0] > 0) | (kpts1[:, 1] > 0)
+        valid_mask1 = (kpts2[:, 0] > 0) | (kpts2[:, 1] > 0)
+        # Supposons un ordonnancement 1-1 des points annotés; sinon, construire  partir des annotations
+        m = n = 11
+        gt_assignment = torch.zeros((m + 1, n + 1), dtype=torch.float32)
+        # indices valides
+        valid_idx0 = torch.nonzero(valid_mask0, as_tuple=False).squeeze(-1)
+        valid_idx1 = torch.nonzero(valid_mask1, as_tuple=False).squeeze(-1)
+        k = min(len(valid_idx0), len(valid_idx1))
+        # Match identitaire pour les k premiers valides
+        if k > 0:
+            gt_assignment[valid_idx0[:k], valid_idx1[:k]] = 1.0
+        # Colonnes/lignes dummy pour non-appairés
+        neg0 = torch.ones(m)
+        neg1 = torch.ones(n)
+        if k > 0:
+            neg0[valid_idx0[:k]] = 0
+            neg1[valid_idx1[:k]] = 0
+        gt_assignment[:m, -1] = neg0
+        gt_assignment[-1, :n] = neg1
+        gt_matches0 = torch.full((m,), -1, dtype=torch.long)
+        gt_matches1 = torch.full((n,), -1, dtype=torch.long)
+        if k > 0:
+            gt_matches0[valid_idx0[:k]] = valid_idx1[:k]
+            gt_matches1[valid_idx1[:k]] = valid_idx0[:k]
 
         return {
             'image0': img1,
