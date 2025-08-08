@@ -1,0 +1,566 @@
+"""
+# %BANNER_BEGIN%
+# ---------------------------------------------------------------------
+# %COPYRIGHT_BEGIN%
+#
+#  Magic Leap, Inc. ("COMPANY") CONFIDENTIAL
+#
+#  Unpublished Copyright (c) 2020
+#  Magic Leap, Inc., All Rights Reserved.
+#
+# NOTICE:  All information contained herein is, and remains the property
+# of COMPANY. The intellectual and technical concepts contained herein
+# are proprietary to COMPANY and may be covered by U.S. and Foreign
+# Patents, patents in process, and are protected by trade secret or
+# copyright law.  Dissemination of this information or reproduction of
+# this material is strictly forbidden unless prior written permission is
+# obtained from COMPANY.  Access to the source code contained herein is
+# hereby forbidden to anyone except current COMPANY employees, managers
+# or contractors who have executed Confidentiality and Non-disclosure
+# agreements explicitly covering such access.
+#
+# The copyright notice above does not evidence any actual or intended
+# publication or disclosure  of  this source code, which includes
+# information that is confidential and/or proprietary, and is a trade
+# secret, of  COMPANY.   ANY REPRODUCTION, MODIFICATION, DISTRIBUTION,
+# PUBLIC  PERFORMANCE, OR PUBLIC DISPLAY OF OR THROUGH USE  OF THIS
+# SOURCE CODE  WITHOUT THE EXPRESS WRITTEN CONSENT OF COMPANY IS
+# STRICTLY PROHIBITED, AND IN VIOLATION OF APPLICABLE LAWS AND
+# INTERNATIONAL TREATIES.  THE RECEIPT OR POSSESSION OF  THIS SOURCE
+# CODE AND/OR RELATED INFORMATION DOES NOT CONVEY OR IMPLY ANY RIGHTS
+# TO REPRODUCE, DISCLOSE OR DISTRIBUTE ITS CONTENTS, OR TO MANUFACTURE,
+# USE, OR SELL ANYTHING THAT IT  MAY DESCRIBE, IN WHOLE OR IN PART.
+#
+# %COPYRIGHT_END%
+# ----------------------------------------------------------------------
+# %AUTHORS_BEGIN%
+#
+#  Originating Authors: Paul-Edouard Sarlin
+#
+# %AUTHORS_END%
+# --------------------------------------------------------------------*/
+# %BANNER_END%
+
+Described in:
+    SuperPoint: Self-Supervised Interest Point Detection and Description,
+    Daniel DeTone, Tomasz Malisiewicz, Andrew Rabinovich, CVPRW 2018.
+
+Original code: github.com/MagicLeapResearch/SuperPointPretrainedNetwork
+
+Adapted by Philipp Lindenberger (Phil26AT)
+"""
+
+import torch
+from torch import nn
+
+from gluefactory.models.base_model import BaseModel
+from gluefactory.models.utils.misc import pad_and_stack
+import torch.nn.functional as F
+
+
+def simple_nms(scores, radius):
+    """Perform non maximum suppression on the heatmap using max-pooling.
+    This method does not suppress contiguous points that have the same score.
+    Args:
+        scores: the score heatmap of size (B, H, W).
+        radius: an integer scalar, the radius of the NMS window.
+    """
+
+    def max_pool(x):
+        return torch.nn.functional.max_pool2d(
+            x, kernel_size=radius * 2 + 1, stride=1, padding=radius
+        )
+
+    zeros = torch.zeros_like(scores)
+    max_mask = scores == max_pool(scores)
+    for _ in range(2):
+        supp_mask = max_pool(max_mask.float()) > 0
+        supp_scores = torch.where(supp_mask, zeros, scores)
+        new_max_mask = supp_scores == max_pool(supp_scores)
+        max_mask = max_mask | (new_max_mask & (~supp_mask))
+    return torch.where(max_mask, scores, zeros)
+
+
+def top_k_keypoints(keypoints, scores, k):
+    if k >= len(keypoints):
+        return keypoints, scores
+    scores, indices = torch.topk(scores, k, dim=0, sorted=True)
+    return keypoints[indices], scores
+
+
+def sample_k_keypoints(keypoints, scores, k):
+    if k >= len(keypoints):
+        return keypoints, scores
+    indices = torch.multinomial(scores, k, replacement=False)
+    return keypoints[indices], scores[indices]
+
+
+def soft_argmax_refinement(keypoints, scores, radius: int):
+    width = 2 * radius + 1
+    sum_ = torch.nn.functional.avg_pool2d(
+        scores[:, None], width, 1, radius, divisor_override=1
+    )
+    ar = torch.arange(-radius, radius + 1).to(scores)
+    kernel_x = ar[None].expand(width, -1)[None, None]
+    dx = torch.nn.functional.conv2d(scores[:, None], kernel_x, padding=radius)
+    dy = torch.nn.functional.conv2d(
+        scores[:, None], kernel_x.transpose(2, 3), padding=radius
+    )
+    dydx = torch.stack([dy[:, 0], dx[:, 0]], -1) / sum_[:, 0, :, :, None]
+    refined_keypoints = []
+    for i, kpts in enumerate(keypoints):
+        delta = dydx[i][tuple(kpts.t())]
+        refined_keypoints.append(kpts.float() + delta)
+    return refined_keypoints
+
+
+# Legacy (broken) sampling of the descriptors
+def sample_descriptors(keypoints, descriptors, s):
+    b, c, h, w = descriptors.shape
+    keypoints = keypoints - s / 2 + 0.5
+    keypoints /= torch.tensor(
+        [(w * s - s / 2 - 0.5), (h * s - s / 2 - 0.5)],
+    ).to(
+        keypoints
+    )[None]
+    keypoints = keypoints * 2 - 1  # normalize to (-1, 1)
+    args = {"align_corners": True} if torch.__version__ >= "1.3" else {}
+    descriptors = torch.nn.functional.grid_sample(
+        descriptors, keypoints.view(b, 1, -1, 2), mode="bilinear", **args
+    )
+    descriptors = torch.nn.functional.normalize(
+        descriptors.reshape(b, c, -1), p=2, dim=1
+    )
+    return descriptors
+
+
+# The original keypoint sampling is incorrect. We patch it here but
+# keep the original one above for legacy.
+def sample_descriptors_fix_sampling(keypoints, descriptors, s: int = 8):
+    """Interpolate descriptors at keypoint locations"""
+    b, c, h, w = descriptors.shape
+    keypoints = keypoints / (keypoints.new_tensor([w, h]) * s)
+    keypoints = keypoints * 2 - 1  # normalize to (-1, 1)
+    descriptors = torch.nn.functional.grid_sample(
+        descriptors, keypoints.view(b, 1, -1, 2), mode="bilinear", align_corners=False
+    )
+    descriptors = torch.nn.functional.normalize(
+        descriptors.reshape(b, c, -1), p=2, dim=1
+    )
+    return descriptors
+
+
+def interpolate_descriptors(desc_map: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+    """
+    Interpole les descripteurs [B, D, H, W] aux positions [B, N, 2] des keypoints.
+    
+    Args:
+        desc_map: [B, D, H, W]
+        keypoints: [B, N, 2] (coordonnées en pixels)
+    
+    Returns:
+        interpolated: [B, N, D]
+    """
+    B, D, H, W = desc_map.shape
+
+    # Normaliser les keypoints dans [-1, 1]
+    keypoints_norm = keypoints.clone()
+    keypoints_norm[..., 0] = (keypoints[..., 0] / (W - 1)) * 2 - 1  # x
+    keypoints_norm[..., 1] = (keypoints[..., 1] / (H - 1)) * 2 - 1  # y
+
+    grid = keypoints_norm.view(B, -1, 1, 2)  # [B, N, 1, 2]
+
+    # F.grid_sample attend [B, D, H, W] et grid [B, N, 1, 2]
+    sampled = F.grid_sample(
+        desc_map, grid, mode="bilinear", align_corners=True
+    )  # [B, D, N, 1]
+
+    return sampled.squeeze(-1).permute(0, 2, 1)  # [B, N, D]
+
+##################################################################################
+
+
+
+class SuperPoint(BaseModel):
+    default_conf = {
+        "has_detector": True,
+        "has_descriptor": True,
+        "descriptor_dim": 256,
+        # Inference
+        "sparse_outputs": True,
+        "dense_outputs": True,
+        "nms_radius": 4,
+        "refinement_radius": 0,
+        "detection_threshold": 0.005,
+        "max_num_keypoints": -1,
+        "max_num_keypoints_val": None,
+        "force_num_keypoints": False,
+        "randomize_keypoints_training": False,
+        "remove_borders": 4,
+        "legacy_sampling": True,  # True to use the old broken sampling
+    }
+    required_data_keys = ["image"]
+
+    checkpoint_url = "https://github.com/magicleap/SuperGluePretrainedNetwork/raw/master/models/weights/superpoint_v1.pth"  # noqa: E501
+
+    def _init(self, conf):
+        self.relu = nn.ReLU(inplace=True)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
+
+        self.conv1a = nn.Conv2d(1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv1b = nn.Conv2d(c1, c1, kernel_size=3, stride=1, padding=1)
+        self.conv2a = nn.Conv2d(c1, c2, kernel_size=3, stride=1, padding=1)
+        self.conv2b = nn.Conv2d(c2, c2, kernel_size=3, stride=1, padding=1)
+        self.conv3a = nn.Conv2d(c2, c3, kernel_size=3, stride=1, padding=1)
+        self.conv3b = nn.Conv2d(c3, c3, kernel_size=3, stride=1, padding=1)
+        self.conv4a = nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1)
+        self.conv4b = nn.Conv2d(c4, c4, kernel_size=3, stride=1, padding=1)
+
+        if conf.has_detector:
+            self.convPa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+            self.convPb = nn.Conv2d(c5, 65, kernel_size=1, stride=1, padding=0)
+
+        if conf.has_descriptor:
+            self.convDa = nn.Conv2d(c4, c5, kernel_size=3, stride=1, padding=1)
+            self.convDb = nn.Conv2d(
+                c5, conf.descriptor_dim, kernel_size=1, stride=1, padding=0
+            )
+
+        self.load_state_dict(
+            torch.hub.load_state_dict_from_url(str(self.checkpoint_url)), strict=False
+        )
+
+    def _forward(self, data):
+        image = data["image"]
+        if image.shape[1] == 3:  # RGB
+            scale = image.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+            image = (image * scale).sum(1, keepdim=True)
+
+        # Shared Encoder
+        x = self.relu(self.conv1a(image))
+        x = self.relu(self.conv1b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2a(x))
+        x = self.relu(self.conv2b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3a(x))
+        x = self.relu(self.conv3b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv4a(x))
+        x = self.relu(self.conv4b(x))
+
+        pred = {}
+        if self.conf.has_detector:
+            # Compute the dense keypoint scores
+            cPa = self.relu(self.convPa(x))
+            scores = self.convPb(cPa)
+            scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
+            b, c, h, w = scores.shape
+            scores = scores.permute(0, 2, 3, 1).reshape(b, h, w, 8, 8)
+            scores = scores.permute(0, 1, 3, 2, 4).reshape(b, h * 8, w * 8)
+            pred["keypoint_scores"] = dense_scores = scores
+        if self.conf.has_descriptor:
+            # Compute the dense descriptors
+            cDa = self.relu(self.convDa(x))
+            dense_desc = self.convDb(cDa)
+            dense_desc = torch.nn.functional.normalize(dense_desc, p=2, dim=1)
+            pred["descriptors"] = dense_desc
+
+        if self.conf.sparse_outputs:
+            assert self.conf.has_detector and self.conf.has_descriptor
+
+            scores = simple_nms(scores, self.conf.nms_radius)
+
+            # Discard keypoints near the image borders
+            if self.conf.remove_borders:
+                scores[:, : self.conf.remove_borders] = -1
+                scores[:, :, : self.conf.remove_borders] = -1
+                if "image_size" in data:
+                    for i in range(scores.shape[0]):
+                        w, h = data["image_size"][i]
+                        scores[i, int(h.item()) - self.conf.remove_borders :] = -1
+                        scores[i, :, int(w.item()) - self.conf.remove_borders :] = -1
+                else:
+                    scores[:, -self.conf.remove_borders :] = -1
+                    scores[:, :, -self.conf.remove_borders :] = -1
+
+            # Extract keypoints
+            best_kp = torch.where(scores > self.conf.detection_threshold)
+            scores = scores[best_kp]
+
+            # Separate into batches
+            keypoints = [
+                torch.stack(best_kp[1:3], dim=-1)[best_kp[0] == i] for i in range(b)
+            ]
+            scores = [scores[best_kp[0] == i] for i in range(b)]
+
+            # Keep the k keypoints with highest score
+            max_kps = self.conf.max_num_keypoints
+
+            # for val we allow different
+            if not self.training and self.conf.max_num_keypoints_val is not None:
+                max_kps = self.conf.max_num_keypoints_val
+
+            # Keep the k keypoints with highest score
+            if max_kps > 0:
+                if self.conf.randomize_keypoints_training and self.training:
+                    # instead of selecting top-k, sample k by score weights
+                    keypoints, scores = list(
+                        zip(
+                            *[
+                                sample_k_keypoints(k, s, max_kps)
+                                for k, s in zip(keypoints, scores)
+                            ]
+                        )
+                    )
+                else:
+                    keypoints, scores = list(
+                        zip(
+                            *[
+                                top_k_keypoints(k, s, max_kps)
+                                for k, s in zip(keypoints, scores)
+                            ]
+                        )
+                    )
+                keypoints, scores = list(keypoints), list(scores)
+
+            if self.conf["refinement_radius"] > 0:
+                keypoints = soft_argmax_refinement(
+                    keypoints, dense_scores, self.conf["refinement_radius"]
+                )
+
+            # Convert (h, w) to (x, y)
+            keypoints = [torch.flip(k, [1]).float() for k in keypoints]
+
+            if self.conf.force_num_keypoints:
+                keypoints = pad_and_stack(
+                    keypoints,
+                    max_kps,
+                    -2,
+                    mode="random_c",
+                    bounds=(
+                        0,
+                        data.get("image_size", torch.tensor(image.shape[-2:]))
+                        .min()
+                        .item(),
+                    ),
+                )
+                scores = pad_and_stack(scores, max_kps, -1, mode="zeros")
+            else:
+                keypoints = torch.stack(keypoints, 0)
+                scores = torch.stack(scores, 0)
+
+            # Extract descriptors
+            if (len(keypoints) == 1) or self.conf.force_num_keypoints:
+                # Batch sampling of the descriptors
+                if self.conf.legacy_sampling:
+                    desc = sample_descriptors(keypoints, dense_desc, 8)
+                else:
+                    desc = sample_descriptors_fix_sampling(keypoints, dense_desc, 8)
+            else:
+                if self.conf.legacy_sampling:
+                    desc = [
+                        sample_descriptors(k[None], d[None], 8)[0]
+                        for k, d in zip(keypoints, dense_desc)
+                    ]
+                else:
+                    desc = [
+                        sample_descriptors_fix_sampling(k[None], d[None], 8)[0]
+                        for k, d in zip(keypoints, dense_desc)
+                    ]
+            #print("Desc shape avant flatten :", dense_desc.shape)
+            #print("Desc shape après flatten :", desc.shape)
+            pred = {
+                "keypoints": keypoints + 0.5,
+                "keypoint_scores": scores,
+                "descriptors": desc.transpose(-1, -2),
+            }
+
+            if self.conf.dense_outputs:
+                pred["dense_descriptors"] = dense_desc
+
+        return pred
+
+##############################################################################################################
+
+    def descriptor_loss(self, dense_descriptors, gt_keypoints, gt_descriptors):
+        """
+        Calcule la perte de similarité entre les descripteurs interpolés aux positions GT et les GT fournis.
+        dense_descriptors : [B, D, H, W]
+        gt_keypoints : [B, N, 2] en pixels
+        gt_descriptors : [B, N, D]
+        """
+        # Interpoler les descripteurs aux points GT
+        interpolated = interpolate_descriptors(dense_descriptors, gt_keypoints)  # [B, N, D]
+        
+        # Normaliser
+        interpolated = F.normalize(interpolated, p=2, dim=-1)
+        gt_descriptors = F.normalize(gt_descriptors, p=2, dim=-1)
+
+        # Cosine similarity loss : 1 - cos_sim
+        loss = 1 - (interpolated * gt_descriptors).sum(dim=-1)  # [B, N]
+        return loss.mean()
+
+##############################################################################################################
+
+
+    """
+    def find_closest_keypoints(self, pred_keypoints, pred_descriptors, gt_keypoints, lambda_weight=0.7):
+    """
+    """
+        Associe chaque point GT au keypoint extrait spatialement le plus proche,
+        en combinant la distance spatiale et la similarité des descripteurs.
+        
+        Args:
+            pred_keypoints: [B, N_pred, 2]
+            pred_descriptors: [B, D, N_pred]
+            gt_keypoints: [B, 11, 2]
+            lambda_weight: balance entre distance (lambda) et descripteur (1-lambda)
+        
+        Returns:
+            selected_keypoints: [B, 11, 2]
+            selected_descriptors: [B, 11, D]
+            loss: scalaire moyen
+        """
+    """
+        B, N_gt, _ = gt_keypoints.shape
+        _, D, N_pred = pred_descriptors.shape
+
+        selected_keypoints = []
+        selected_descriptors = []
+        all_losses = []
+
+        for b in range(B):
+            gt = gt_keypoints[b]              # [11, 2]
+            pred_kpts = pred_keypoints[b]     # [N_pred, 2]
+            pred_desc = pred_descriptors[b].T # [N_pred, D]
+
+            valid_mask = (gt[:, 0] >= 0) & (gt[:, 0] < 512) & (gt[:, 1] >= 0) & (gt[:, 1] < 512)
+            gt = gt[valid_mask]
+
+            if len(gt) == 0:
+                selected_keypoints.append(torch.zeros((11, 2), device=gt_keypoints.device))
+                selected_descriptors.append(torch.zeros((11, D), device=gt_keypoints.device))
+                all_losses.append(torch.tensor(1.0, device=gt_keypoints.device))
+                continue
+
+            # Distance spatiale
+            dist = torch.cdist(gt, pred_kpts)  # [n_valid_gt, N_pred]
+
+            # Similarité cosinus
+            pred_desc_norm = F.normalize(pred_desc, p=2, dim=-1)
+            cosine_sim = torch.matmul(pred_desc_norm, pred_desc_norm.T)  # [N_pred, N_pred]
+            cosine_sim = cosine_sim.diagonal().unsqueeze(0).expand(dist.size())  # Fake: diagonale étendue
+
+            # Combinaison coût
+            cost = lambda_weight * dist - (1 - lambda_weight) * cosine_sim  # [n_valid_gt, N_pred]
+
+            min_costs, indices = cost.min(dim=1)  # [n_valid_gt]
+
+            # Sélection des meilleurs matches
+            matched_kpts = pred_kpts[indices]      # [n_valid_gt, 2]
+            matched_desc = pred_desc[indices]      # [n_valid_gt, D]
+
+            if matched_kpts.shape[0] < 11:
+                pad_kpts = torch.zeros((11 - matched_kpts.shape[0], 2), device=gt.device)
+                pad_desc = torch.zeros((11 - matched_desc.shape[0], D), device=gt.device)
+                matched_kpts = torch.cat([matched_kpts, pad_kpts], dim=0)
+                matched_desc = torch.cat([matched_desc, pad_desc], dim=0)
+
+            selected_keypoints.append(matched_kpts)
+            selected_descriptors.append(matched_desc)
+            all_losses.append(min_costs.mean())
+
+        selected_keypoints = torch.stack(selected_keypoints)
+        selected_descriptors = torch.stack(selected_descriptors)
+        loss = torch.stack(all_losses).mean()
+
+        return selected_keypoints, selected_descriptors, loss
+        """
+
+    def find_closest_keypoints(self, pred_keypoints, pred_descriptors, gt_keypoints, pred_dense_desc, lambda_weight=0.7):
+        """
+        Associe chaque point GT au keypoint extrait spatialement le plus proche,
+        en combinant la distance spatiale et la similarité des descripteurs.
+        
+        Args:
+            pred_keypoints: [B, N_pred, 2]
+            pred_descriptors: [B, D, N_pred]
+            gt_keypoints: [B, 11, 2]
+            pred_dense_desc: [B, D, H, W]  (nécessaire pour interpoler les GT)
+            lambda_weight: balance entre distance (lambda) et descripteur (1-lambda)
+
+        Returns:
+            selected_keypoints: [B, 11, 2]
+            selected_descriptors: [B, 11, D]
+            loss: scalaire moyen
+        """
+        B, N_gt, _ = gt_keypoints.shape
+        _, D, N_pred = pred_descriptors.shape
+
+        selected_keypoints = []
+        selected_descriptors = []
+        all_losses = []
+
+        for b in range(B):
+            gt = gt_keypoints[b]               # [11, 2]
+            pred_kpts = pred_keypoints[b]      # [N_pred, 2]
+            pred_desc = pred_descriptors[b].T  # [N_pred, D]
+            dense_desc_map = pred_dense_desc[b].unsqueeze(0)  # [1, D, H, W]
+
+            # Filtrer les GT valides
+            valid_mask = (gt[:, 0] >= 0) & (gt[:, 0] < 512) & (gt[:, 1] >= 0) & (gt[:, 1] < 512)
+            gt = gt[valid_mask]
+            if len(gt) == 0:
+                selected_keypoints.append(torch.zeros((11, 2), device=gt_keypoints.device))
+                selected_descriptors.append(torch.zeros((11, D), device=gt_keypoints.device))
+                all_losses.append(torch.tensor(1.0, device=gt_keypoints.device))
+                continue
+
+            # 1. Distance spatiale
+            dist = torch.cdist(gt, pred_kpts)  # [n_valid_gt, N_pred]
+
+            # 2. Descripteurs interpolés aux GT
+            interpolated_desc = interpolate_descriptors(dense_desc_map, gt.unsqueeze(0)).squeeze(0)  # [n_valid_gt, D]
+
+            # 3. Similitude cosinus
+            pred_desc_norm = F.normalize(pred_desc, p=2, dim=-1)  # [N_pred, D]
+            gt_desc_norm = F.normalize(interpolated_desc, p=2, dim=-1)  # [n_valid_gt, D]
+            cosine_sim = torch.matmul(gt_desc_norm, pred_desc_norm.T)  # [n_valid_gt, N_pred]
+
+            # Normalisation de la distance par ligne (chaque point GT)
+            dist_norm = (dist - dist.min(dim=1, keepdim=True).values) / (
+                dist.max(dim=1, keepdim=True).values - dist.min(dim=1, keepdim=True).values + 1e-8
+            )
+
+            # 4. Combinaison coût
+            cost = lambda_weight * dist_norm - (1 - lambda_weight) * cosine_sim  # [n_valid_gt, N_pred]
+            min_costs, indices = cost.min(dim=1)  # [n_valid_gt]
+
+            matched_kpts = pred_kpts[indices]      # [n_valid_gt, 2]
+            matched_desc = pred_desc[indices]      # [n_valid_gt, D]
+
+            # 5. Padding si moins de 11 GT
+            if matched_kpts.shape[0] < 11:
+                pad_kpts = torch.zeros((11 - matched_kpts.shape[0], 2), device=gt.device)
+                pad_desc = torch.zeros((11 - matched_desc.shape[0], D), device=gt.device)
+                matched_kpts = torch.cat([matched_kpts, pad_kpts], dim=0)
+                matched_desc = torch.cat([matched_desc, pad_desc], dim=0)
+
+            selected_keypoints.append(matched_kpts)
+            selected_descriptors.append(matched_desc)
+            all_losses.append(min_costs.mean())
+
+        return (
+            torch.stack(selected_keypoints),
+            torch.stack(selected_descriptors),
+            torch.stack(all_losses).mean(),
+        )
+
+
+    def loss(self, pred, data):
+        raise NotImplementedError
+
+    def metrics(self, pred, data):
+        raise NotImplementedError
