@@ -27,19 +27,23 @@ model:
     name: two_view_pipeline
     extractor:
         name: gluefactory_nonfree.superpoint
-        max_num_keypoints: 256
+        max_num_keypoints: 1024
         force_num_keypoints: true
-        detection_threshold: 0.001
+        detection_threshold: 0.003
         nms_radius: 4      
         trainable: True
+        randomize_keypoints_training: true
     matcher:
         name: matchers.lightglue
-        filter_threshold: 0.1
+        filter_threshold: 0.05
         flash: false
         checkpointed: true
         n_layers: 6
-        num_heads: 4  # Augmenter le nombre de têtes d'attention
+        num_heads: 4
         width: 128
+        loss:
+            nll_balancing: 0.7
+            gamma_f: 2.0
     ground_truth:
         name: matchers.depth_matcher
         th_positive: 3
