@@ -509,8 +509,9 @@ class SuperPoint(BaseModel):
             pred_desc = pred_descriptors[b].T  # [N_pred, D]
             dense_desc_map = pred_dense_desc[b].unsqueeze(0)  # [1, D, H, W]
 
-            # Filtrer les GT valides
-            valid_mask = (gt[:, 0] >= 0) & (gt[:, 0] < 512) & (gt[:, 1] >= 0) & (gt[:, 1] < 512)
+            # Filtrer les GT valides selon la vraie taille (W,H)
+            H, W = dense_desc_map.shape[-2:]
+            valid_mask = (gt[:, 0] >= 0) & (gt[:, 0] < W) & (gt[:, 1] >= 0) & (gt[:, 1] < H)
             gt = gt[valid_mask]
             if len(gt) == 0:
                 selected_keypoints.append(torch.zeros((11, 2), device=gt_keypoints.device))
