@@ -289,39 +289,21 @@ class MatchAssignment(nn.Module):
 
 
 def filter_matches(scores: torch.Tensor, th: float):
-    #Amélioration du filtrage des correspondances
+    # obtain matches from a log assignment matrix [B x M+1 x N+1]
     max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
     m0, m1 = max0.indices, max1.indices
-   
-    # Augmenter les scores
-    max0_exp = (max0.values * 2.0).exp()  # Multiplier par 2 pour augmenter les scores
-   
-    # Ajouter un terme de bonus pour les correspondances mutuelles
     indices0 = torch.arange(m0.shape[1], device=m0.device)[None]
     indices1 = torch.arange(m1.shape[1], device=m1.device)[None]
     mutual0 = indices0 == m1.gather(1, m0)
     mutual1 = indices1 == m0.gather(1, m1)
-   
-    # Bonus pour les correspondances mutuelles
-    mutual_bonus = 0.5  # Ajouter un bonus aux scores mutuels
-   
+    max0_exp = max0.values.exp()
     zero = max0_exp.new_tensor(0)
-    mscores0 = torch.where(mutual0, max0_exp + mutual_bonus, zero)
-    mscores1 = torch.where(mutual1, mscores0.gather(1, m1) + mutual_bonus, zero)
-   
-    # Réduire le seuil effectif
-    th_effective = th * 0.5
-   
-    valid0 = mutual0 & (mscores0 > th_effective)
+    mscores0 = torch.where(mutual0, max0_exp, zero)
+    mscores1 = torch.where(mutual1, mscores0.gather(1, m1), zero)
+    valid0 = mutual0 & (mscores0 > th)
     valid1 = mutual1 & valid0.gather(1, m1)
-    # Normalisation des scores
-    #mscores0 = torch.clamp(mscores0, 0, 1)  ############
-    #mscores1 = torch.clamp(mscores1, 0, 1)  ############
-
-   
     m0 = torch.where(valid0, m0, -1)
     m1 = torch.where(valid1, m1, -1)
-   
     return m0, m1, mscores0, mscores1
 
 """
