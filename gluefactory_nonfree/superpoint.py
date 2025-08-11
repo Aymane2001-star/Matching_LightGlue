@@ -193,6 +193,7 @@ class SuperPoint(BaseModel):
         "refinement_radius": 0,
         "detection_threshold": 0.005,
         "max_num_keypoints": -1,
+        "dropout_rate": 0.1,
         "max_num_keypoints_val": None,
         "force_num_keypoints": False,
         "randomize_keypoints_training": False,
@@ -206,6 +207,7 @@ class SuperPoint(BaseModel):
     def _init(self, conf):
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(p=self.conf.dropout_rate)     #####################
         c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
 
         self.conv1a = nn.Conv2d(1, c1, kernel_size=3, stride=1, padding=1)
@@ -239,21 +241,21 @@ class SuperPoint(BaseModel):
 
         # Shared Encoder
         x = self.relu(self.conv1a(image))
-        x = self.relu(self.conv1b(x))
+        x = self.dropout(self.relu(self.conv1b(x)))  # Ajoutez le dropout ici
         x = self.pool(x)
         x = self.relu(self.conv2a(x))
-        x = self.relu(self.conv2b(x))
+        x = self.dropout(self.relu(self.conv2b(x)))  # Ajoutez le dropout ici
         x = self.pool(x)
         x = self.relu(self.conv3a(x))
-        x = self.relu(self.conv3b(x))
+        x = self.dropout(self.relu(self.conv3b(x)))  # Ajoutez le dropout ici
         x = self.pool(x)
         x = self.relu(self.conv4a(x))
-        x = self.relu(self.conv4b(x))
+        x = self.dropout(self.relu(self.conv4b(x)))  # Ajoutez le dropout ici
 
         pred = {}
         if self.conf.has_detector:
             # Compute the dense keypoint scores
-            cPa = self.relu(self.convPa(x))
+            cPa = self.dropout(self.relu(self.convPa(x)))  # Ajoutez le dropout ici
             scores = self.convPb(cPa)
             scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
             b, c, h, w = scores.shape
@@ -262,7 +264,7 @@ class SuperPoint(BaseModel):
             pred["keypoint_scores"] = dense_scores = scores
         if self.conf.has_descriptor:
             # Compute the dense descriptors
-            cDa = self.relu(self.convDa(x))
+            cDa = self.dropout(self.relu(self.convDa(x)))  # Ajoutez le dropout ici
             dense_desc = self.convDb(cDa)
             dense_desc = torch.nn.functional.normalize(dense_desc, p=2, dim=1)
             pred["descriptors"] = dense_desc

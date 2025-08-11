@@ -241,7 +241,7 @@ class FloorPlanDataset(Dataset):
         valid_mask1 = (kpts2[:, 0] > 0) | (kpts2[:, 1] > 0)
         # Supposons un ordonnancement 1-1 des points annotés; sinon, construire  partir des annotations
         m = n = 11
-        gt_assignment = torch.zeros((m + 1, n + 1), dtype=torch.float32)
+        gt_assignment = torch.zeros((m , n), dtype=torch.float32)
         # indices valides
         valid_idx0 = torch.nonzero(valid_mask0, as_tuple=False).squeeze(-1)
         valid_idx1 = torch.nonzero(valid_mask1, as_tuple=False).squeeze(-1)

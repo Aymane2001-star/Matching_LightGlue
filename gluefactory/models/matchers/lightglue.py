@@ -124,7 +124,7 @@ class Attention(nn.Module):
 
 class SelfBlock(nn.Module):
     def __init__(
-        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
+        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True, dropout: float = 0.1
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -140,6 +140,7 @@ class SelfBlock(nn.Module):
             nn.GELU(),
             nn.Linear(2 * embed_dim, embed_dim),
         )
+        self.dropout = nn.Dropout(dropout)        ###############
 
     def forward(
         self,
@@ -154,12 +155,15 @@ class SelfBlock(nn.Module):
         k = apply_cached_rotary_emb(encoding, k)
         context = self.inner_attn(q, k, v, mask=mask)
         message = self.out_proj(context.transpose(1, 2).flatten(start_dim=-2))
-        return x + self.ffn(torch.cat([x, message], -1))
+        message = self.dropout(message)
+        x = x + message
+        x = x + self.dropout(self.ffn(torch.cat([x, message], -1)))
+        return x 
 
 
 class CrossBlock(nn.Module):
     def __init__(
-        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True
+        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True,  dropout: float = 0.1
     ) -> None:
         super().__init__()
         self.heads = num_heads
@@ -175,6 +179,7 @@ class CrossBlock(nn.Module):
             nn.GELU(),
             nn.Linear(2 * embed_dim, embed_dim),
         )
+        self.dropout = nn.Dropout(dropout)        ###############
         if flash and FLASH_AVAILABLE:
             self.flash = Attention(True)
         else:
@@ -210,16 +215,19 @@ class CrossBlock(nn.Module):
                 m0, m1 = m0.nan_to_num(), m1.nan_to_num()
         m0, m1 = self.map_(lambda t: t.transpose(1, 2).flatten(start_dim=-2), m0, m1)
         m0, m1 = self.map_(self.to_out, m0, m1)
+        m0, m1 = self.map_(self.dropout, m0, m1)           ###################
         x0 = x0 + self.ffn(torch.cat([x0, m0], -1))
         x1 = x1 + self.ffn(torch.cat([x1, m1], -1))
+        x0 = x0 + self.dropout(self.ffn(torch.cat([x0, m0], -1)))  ###################
+        x1 = x1 + self.dropout(self.ffn(torch.cat([x1, m1], -1)))  ###################
         return x0, x1
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, dropout = 0.1, **kwargs ):
         super().__init__()
-        self.self_attn = SelfBlock(*args, **kwargs)
-        self.cross_attn = CrossBlock(*args, **kwargs)
+        self.self_attn = SelfBlock(*args, dropout=dropout, **kwargs)
+        self.cross_attn = CrossBlock(*args, dropout=dropout, **kwargs)
 
     def forward(
         self,
@@ -292,27 +300,18 @@ def filter_matches(scores: torch.Tensor, th: float):
     #Amélioration du filtrage des correspondances
     max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
     m0, m1 = max0.indices, max1.indices
-   
-    # Augmenter les scores
-    max0_exp = (max0.values * 2.0).exp()  # Multiplier par 2 pour augmenter les scores
-   
-    # Ajouter un terme de bonus pour les correspondances mutuelles
+
     indices0 = torch.arange(m0.shape[1], device=m0.device)[None]
     indices1 = torch.arange(m1.shape[1], device=m1.device)[None]
     mutual0 = indices0 == m1.gather(1, m0)
     mutual1 = indices1 == m0.gather(1, m1)
    
-    # Bonus pour les correspondances mutuelles
-    mutual_bonus = 0.5  # Ajouter un bonus aux scores mutuels
+    max0_exp = max0.values.exp()
    
     zero = max0_exp.new_tensor(0)
-    mscores0 = torch.where(mutual0, max0_exp + mutual_bonus, zero)
-    mscores1 = torch.where(mutual1, mscores0.gather(1, m1) + mutual_bonus, zero)
-   
-    # Réduire le seuil effectif
-    th_effective = th * 0.5
-   
-    valid0 = mutual0 & (mscores0 > th_effective)
+    mscores0 = torch.where(mutual0, max0_exp, zero)
+    mscores1 = torch.where(mutual1, mscores0.gather(1, m1), zero)
+    valid0 = mutual0 & (mscores0 > th)
     valid1 = mutual1 & valid0.gather(1, m1)
     # Normalisation des scores
     #mscores0 = torch.clamp(mscores0, 0, 1)  ############
@@ -360,6 +359,7 @@ class LightGlue(nn.Module):
         "checkpointed": False,
         "weights": None,  # either a path or the name of pretrained weights (disk, ...)
         "weights_from_version": "v0.1_arxiv",
+        "dropout": 0.1,  # Ajoutez cette ligne
         "loss": {
             "gamma": 1.0,
             "fn": "nll",
@@ -388,7 +388,7 @@ class LightGlue(nn.Module):
         h, n, d = conf.num_heads, conf.n_layers, conf.descriptor_dim
 
         self.transformers = nn.ModuleList(
-            [TransformerLayer(d, h, conf.flash) for _ in range(n)]
+            [TransformerLayer(d, h, conf.flash,  dropout=conf.dropout) for _ in range(n)]
         )
 
         self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(n)])
