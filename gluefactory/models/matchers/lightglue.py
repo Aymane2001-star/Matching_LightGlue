@@ -278,14 +278,20 @@ class MatchAssignment(nn.Module):
         self.dim = dim
         self.matchability = nn.Linear(dim, 1, bias=True)
         self.final_proj = nn.Linear(dim, dim, bias=True)
+        # optional whitening projection to improve descriptor isotropy
+        self.whiten = nn.LayerNorm(dim, elementwise_affine=False)
+        self.register_buffer("temperature", torch.tensor(0.07))
 
 
     def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
         """build assignment matrix from descriptors"""
         mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
         _, _, d = mdesc0.shape
-        mdesc0, mdesc1 = mdesc0 / d**0.25, mdesc1 / d**0.25   # modifier 0.25 par 0.1
-        sim = torch.einsum("bmd,bnd->bmn", mdesc0, mdesc1) 
+        # normalize and optionally whiten to improve stability
+        mdesc0 = torch.nn.functional.normalize(self.whiten(mdesc0), p=2, dim=-1)
+        mdesc1 = torch.nn.functional.normalize(self.whiten(mdesc1), p=2, dim=-1)
+        # temperature-scaled cosine similarity
+        sim = torch.einsum("bmd,bnd->bmn", mdesc0, mdesc1) / self.temperature
         z0 = self.matchability(desc0)
         z1 = self.matchability(desc1)
         scores = sigmoid_log_double_softmax(sim, z0, z1)
@@ -311,6 +317,12 @@ def filter_matches(scores: torch.Tensor, th: float):
     zero = max0_exp.new_tensor(0)
     mscores0 = torch.where(mutual0, max0_exp, zero)
     mscores1 = torch.where(mutual1, mscores0.gather(1, m1), zero)
+    # encourage stricter mutuality when two candidates are close (sharpen)
+    # compare top1 vs top2 gap
+    with torch.no_grad():
+        top2_0 = torch.topk(scores[:, :-1, :-1], k=2, dim=2).values
+        gap0 = (top2_0[..., 0] - top2_0[..., 1]).exp()
+        sharpen0 = (gap0 > 1.05)  # small gap -> keep permissive; large gap -> require higher score
     valid0 = mutual0 & (mscores0 > th)
     valid1 = mutual1 & valid0.gather(1, m1)
     # Normalisation des scores
@@ -355,7 +367,7 @@ class LightGlue(nn.Module):
         "mp": False,  # enable mixed precision
         "depth_confidence": -1,  # early stopping, disable with -1
         "width_confidence": -1,  # point pruning, disable with -1
-        "filter_threshold": 0.0,  # match threshold
+        "filter_threshold": 0.03,  # match threshold (slightly permissive)
         "checkpointed": False,
         "weights": None,  # either a path or the name of pretrained weights (disk, ...)
         "weights_from_version": "v0.1_arxiv",

@@ -130,6 +130,19 @@ class SuperPoint(BaseModel):
             self.descriptor(features), p=2, dim=1
         )
 
+        # If keypoints are provided, bypass detection and sample descriptors at these locations
+        if "keypoints" in data:
+            keypoints = data["keypoints"]
+            desc = sample_descriptors(keypoints, descriptors_dense, self.stride)
+            pred = {
+                "keypoints": keypoints + 0.5,
+                "keypoint_scores": torch.ones(keypoints.shape[:-1], device=keypoints.device),
+                "descriptors": desc.transpose(-1, -2),
+            }
+            if self.conf.dense_outputs:
+                pred["dense_descriptors"] = descriptors_dense
+            return pred
+
         # Decode the detection scores
         scores = self.detector(features)
         scores = torch.nn.functional.softmax(scores, 1)[:, :-1]
