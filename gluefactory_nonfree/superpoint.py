@@ -267,6 +267,20 @@ class SuperPoint(BaseModel):
             dense_desc = torch.nn.functional.normalize(dense_desc, p=2, dim=1)
             pred["descriptors"] = dense_desc
 
+        # Guided mode: if keypoints are provided, bypass detection and sample descriptors at these keypoints
+        if "keypoints" in data:
+            keypoints = data["keypoints"]  # [B, N, 2] pixel coords
+            # Interpolate descriptors at given keypoints
+            guided_desc = interpolate_descriptors(dense_desc, keypoints)  # [B, N, D]
+            pred_guided = {
+                "keypoints": keypoints,
+                "keypoint_scores": torch.ones(keypoints.shape[:-1], device=keypoints.device),
+                "descriptors": guided_desc.transpose(-1, -2),  # [B, D, N]
+            }
+            if self.conf.dense_outputs:
+                pred_guided["dense_descriptors"] = dense_desc
+            return pred_guided
+
         if self.conf.sparse_outputs:
             assert self.conf.has_detector and self.conf.has_descriptor
 
