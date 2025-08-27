@@ -124,7 +124,7 @@ class Attention(nn.Module):
 
 class SelfBlock(nn.Module):
     def __init__(
-        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True, dropout: float = 0.1
+        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True, dropout: float = 0.0
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -163,7 +163,7 @@ class SelfBlock(nn.Module):
 
 class CrossBlock(nn.Module):
     def __init__(
-        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True,  dropout: float = 0.1
+        self, embed_dim: int, num_heads: int, flash: bool = False, bias: bool = True,  dropout: float = 0.0
     ) -> None:
         super().__init__()
         self.heads = num_heads
@@ -215,16 +215,14 @@ class CrossBlock(nn.Module):
                 m0, m1 = m0.nan_to_num(), m1.nan_to_num()
         m0, m1 = self.map_(lambda t: t.transpose(1, 2).flatten(start_dim=-2), m0, m1)
         m0, m1 = self.map_(self.to_out, m0, m1)
-        m0, m1 = self.map_(self.dropout, m0, m1)           ###################
-        x0 = x0 + self.ffn(torch.cat([x0, m0], -1))
-        x1 = x1 + self.ffn(torch.cat([x1, m1], -1))
-        x0 = x0 + self.dropout(self.ffn(torch.cat([x0, m0], -1)))  ###################
-        x1 = x1 + self.dropout(self.ffn(torch.cat([x1, m1], -1)))  ###################
+        m0, m1 = self.map_(self.dropout, m0, m1)
+        x0 = x0 + self.dropout(self.ffn(torch.cat([x0, m0], -1)))
+        x1 = x1 + self.dropout(self.ffn(torch.cat([x1, m1], -1)))
         return x0, x1
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, *args, dropout = 0.1, **kwargs ):
+    def __init__(self, *args, dropout = 0.0, **kwargs ):
         super().__init__()
         self.self_attn = SelfBlock(*args, dropout=dropout, **kwargs)
         self.cross_attn = CrossBlock(*args, dropout=dropout, **kwargs)
@@ -359,11 +357,11 @@ class LightGlue(nn.Module):
         "checkpointed": False,
         "weights": None,  # either a path or the name of pretrained weights (disk, ...)
         "weights_from_version": "v0.1_arxiv",
-        "dropout": 0.1,  # Ajoutez cette ligne
+        "dropout": 0.0,  # Ajoutez cette ligne
         "loss": {
             "gamma": 1.0,
             "fn": "nll",
-            "nll_balancing": 0.5,
+            "nll_balancing": 0.85,
         },
     }
 

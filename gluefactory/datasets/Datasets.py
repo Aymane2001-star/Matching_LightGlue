@@ -236,32 +236,25 @@ class FloorPlanDataset(Dataset):
         img1 = torch.from_numpy(img1).unsqueeze(0)
         img2 = torch.from_numpy(img2).unsqueeze(0)
 
-        # Construire les GT en tenant compte du padding: -1 pour non-appairés
+        # Construire les GT en tenant compte du padding: -1 pour non-appairés
         valid_mask0 = (kpts1[:, 0] > 0) | (kpts1[:, 1] > 0)
         valid_mask1 = (kpts2[:, 0] > 0) | (kpts2[:, 1] > 0)
-        # Supposons un ordonnancement 1-1 des points annotés; sinon, construire  partir des annotations
         m = n = 11
-        gt_assignment = torch.zeros((m , n), dtype=torch.float32)
-        # indices valides
-        valid_idx0 = torch.nonzero(valid_mask0, as_tuple=False).squeeze(-1)
-        valid_idx1 = torch.nonzero(valid_mask1, as_tuple=False).squeeze(-1)
-        k = min(len(valid_idx0), len(valid_idx1))
-        # Match identitaire pour les k premiers valides
-        if k > 0:
-            gt_assignment[valid_idx0[:k], valid_idx1[:k]] = 1.0
-        # Colonnes/lignes dummy pour non-appairés
-        neg0 = torch.ones(m)
-        neg1 = torch.ones(n)
-        if k > 0:
-            neg0[valid_idx0[:k]] = 0
-            neg1[valid_idx1[:k]] = 0
-        gt_assignment[:m, -1] = neg0
-        gt_assignment[-1, :n] = neg1
+
+        # gt_assignment: uniquement les positifs (M x N), pas de dummy ici
+        gt_assignment = torch.zeros((m, n), dtype=torch.float32)
+
+        # Faire correspondre uniquement les labels présents dans les deux images (intersection)
+        common_idx = torch.nonzero(valid_mask0 & valid_mask1, as_tuple=False).squeeze(-1)
+        if common_idx.numel() > 0:
+            gt_assignment[common_idx, common_idx] = 1.0
+
+        # matches: -1 quand non apparié
         gt_matches0 = torch.full((m,), -1, dtype=torch.long)
         gt_matches1 = torch.full((n,), -1, dtype=torch.long)
-        if k > 0:
-            gt_matches0[valid_idx0[:k]] = valid_idx1[:k]
-            gt_matches1[valid_idx1[:k]] = valid_idx0[:k]
+        if common_idx.numel() > 0:
+            gt_matches0[common_idx] = common_idx
+            gt_matches1[common_idx] = common_idx
 
         return {
             'image0': img1,

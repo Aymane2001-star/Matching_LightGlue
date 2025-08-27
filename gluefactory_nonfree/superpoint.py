@@ -189,11 +189,11 @@ class SuperPoint(BaseModel):
         # Inference
         "sparse_outputs": True,
         "dense_outputs": True,
-        "nms_radius": 4,
+        "nms_radius": 3,
         "refinement_radius": 0,
         "detection_threshold": 0.005,
         "max_num_keypoints": -1,
-        "dropout_rate": 0.1,
+        "dropout_rate": 0.0,
         "max_num_keypoints_val": None,
         "force_num_keypoints": False,
         "randomize_keypoints_training": False,

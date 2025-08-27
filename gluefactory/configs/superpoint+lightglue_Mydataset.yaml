@@ -35,7 +35,7 @@ model:
         randomize_keypoints_training: true
     matcher:
         name: matchers.lightglue
-        filter_threshold: 0.05
+        filter_threshold: 0.0
         flash: false
         checkpointed: true
         n_layers: 6
